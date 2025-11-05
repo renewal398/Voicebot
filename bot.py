@@ -182,32 +182,29 @@ async def main_async() -> None:
     port = int(os.environ.get("PORT", "8080"))
     runner = await start_aiohttp_server(port)
 
-    # Initialize and start the telegram Application without letting it manage the loop
     try:
+        # Start the bot using run_polling (this handles initialization and polling)
         await app.initialize()
         await app.start()
-    except Exception:
-        logger.exception("Failed to initialize/start telegram app")
-        await runner.cleanup()
-        return
-
-    # Start polling inside the existing event loop (background task)
-    polling_task = asyncio.create_task(app.updater.start_polling())
-    logger.info("Started telegram polling task")
-
-    try:
-        # Keep running until polling_task completes (or gets cancelled)
-        await polling_task
+        await app.updater.start_polling()  # Start polling in the background
+        
+        logger.info("Bot started and polling...")
+        
+        # Keep the bot running until interrupted
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour, or use a more sophisticated way to keep it running
+            
     except asyncio.CancelledError:
-        logger.info("Polling task cancelled")
+        logger.info("Received cancellation signal")
     except Exception:
-        logger.exception("Polling task raised an exception")
+        logger.exception("Bot encountered an error")
     finally:
-        # Stop polling and clean up telegram app and aiohttp runner
+        # Proper shutdown sequence
         try:
-            await app.updater.stop_polling()
+            if app.updater and app.updater.running:
+                await app.updater.stop()
         except Exception:
-            logger.exception("Error stopping updater polling")
+            logger.exception("Error stopping updater")
 
         try:
             await app.stop()

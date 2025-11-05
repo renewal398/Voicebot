@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 import os
 import re
+import io
 import base64
 import logging
 import asyncio
@@ -8,7 +10,7 @@ from typing import Optional
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from aiohttp import web
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -129,11 +131,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await msg.reply_text("❌ TTS did not return audio. Please try again with different text.")
             return
 
+        # Send as voice (OGG/OPUS expected). If your TTS returns MP3, adjust filename and method.
         try:
-            await msg.reply_voice(voice=audio_bytes)
+            bio = io.BytesIO(audio_bytes)
+            bio.seek(0)
+            # Choose extension matching your TTS output. Default to .ogg for voice notes.
+            bio.name = "voice.ogg"
+            await msg.reply_voice(voice=InputFile(bio, filename=bio.name))
         except Exception as exc:
             logger.exception("Failed to send voice message: %s", exc)
-            await msg.reply_text("❌ Failed to send voice message. Please try again.")
+            # fallback: try sending as generic audio file
+            try:
+                bio.seek(0)
+                await msg.reply_audio(audio=InputFile(bio, filename="narration.mp3"))
+            except Exception:
+                logger.exception("Failed to send audio file as fallback")
+                await msg.reply_text("❌ Failed to send voice message. Please try again.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -166,28 +179,48 @@ async def main_async() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Start aiohttp server (bind to Render PORT)
+    # Start aiohttp server (bind to PORT)
     port = int(os.environ.get("PORT", "8080"))
     runner = await start_aiohttp_server(port)
 
-    # Start polling as a background task in the same event loop
-    polling_task = asyncio.create_task(app.run_polling())
-    logger.info("Started telegram polling task")
-
-    # Wait until polling_task completes (it runs until cancelled or error)
+    # Initialize and start the telegram Application without letting it manage the loop
     try:
+        await app.initialize()
+        await app.start()
+    except Exception:
+        logger.exception("Failed to initialize/start telegram app")
+        await runner.cleanup()
+        return
+
+    # Start polling in background inside the same event loop
+    try:
+        # For PTB v20+, use updater.start_polling() as a coroutine
+        polling_task = asyncio.create_task(app.updater.start_polling())
+        logger.info("Started telegram polling task")
+
+        # Wait until polling_task finishes (it runs until stopped or error)
         await polling_task
     except asyncio.CancelledError:
         logger.info("Polling task cancelled")
     except Exception:
         logger.exception("Polling task raised an exception")
     finally:
-        # Cleanup: stop telegram app and aiohttp runner
+        # Stop polling and clean up telegram app and aiohttp runner
         try:
-            await app.shutdown()
+            await app.updater.stop_polling()
+        except Exception:
+            logger.exception("Error stopping updater polling")
+
+        try:
             await app.stop()
         except Exception:
-            logger.exception("Error while shutting down telegram app")
+            logger.exception("Error stopping telegram app")
+
+        try:
+            await app.shutdown()
+        except Exception:
+            logger.exception("Error shutting down telegram app")
+
         try:
             await runner.cleanup()
         except Exception:

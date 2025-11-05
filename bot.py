@@ -21,10 +21,23 @@ from telegram.ext import (
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 
+# Voice options - you can add more here
+VOICE_OPTIONS = {
+    "us_female": {"lang": "en", "tld": "com", "name": "US Female"},
+    "us_male": {"lang": "en", "tld": "com", "name": "US Male"},
+    "uk_female": {"lang": "en", "tld": "co.uk", "name": "UK Female"},
+    "uk_male": {"lang": "en", "tld": "co.uk", "name": "UK Male"},
+    "australian": {"lang": "en", "tld": "com.au", "name": "Australian"},
+    "indian": {"lang": "en", "tld": "co.in", "name": "Indian English"},
+    "spanish": {"lang": "es", "tld": "es", "name": "Spanish"},
+    "french": {"lang": "fr", "tld": "fr", "name": "French"},
+    "german": {"lang": "de", "tld": "de", "name": "German"},
+}
+
 # Tunables
 MAX_TEXT_LENGTH = 5000
-MAX_VOICE_MESSAGE_LENGTH = 4096
-CHUNK_DELAY = 1  # seconds between chunks
+CHUNK_DELAY = 1
+DEFAULT_VOICE = "us_male"
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -39,11 +52,9 @@ def split_long_text(text: str, max_length: int = MAX_TEXT_LENGTH) -> List[str]:
     chunks = []
     current_chunk = ""
     
-    # Try to split at sentence boundaries first
     sentences = re.split(r'(?<=[.!?])\s+', text)
     
     for sentence in sentences:
-        # If adding this sentence would exceed max length
         if len(current_chunk) + len(sentence) + 1 > max_length:
             if current_chunk:
                 chunks.append(current_chunk.strip())
@@ -57,17 +68,14 @@ def split_long_text(text: str, max_length: int = MAX_TEXT_LENGTH) -> List[str]:
     if current_chunk:
         chunks.append(current_chunk.strip())
     
-    # If any chunk is still too long, split by paragraphs
     final_chunks = []
     for chunk in chunks:
         if len(chunk) > max_length:
-            # Split by paragraphs or line breaks
             paragraphs = chunk.split('\n\n')
             for para in paragraphs:
                 if len(para) <= max_length:
                     final_chunks.append(para)
                 else:
-                    # Hard split if still too long
                     for i in range(0, len(para), max_length):
                         final_chunks.append(para[i:i+max_length])
         else:
@@ -83,7 +91,6 @@ def apply_pauses(text: str) -> str:
             amount = float(match.group(1))
         except (TypeError, ValueError):
             return match.group(0)
-        # For gTTS, we'll use commas and periods to create natural pauses
         if amount <= 0.3:
             return ","
         else:
@@ -92,19 +99,21 @@ def apply_pauses(text: str) -> str:
     return re.sub(r"\[PAUSE\s*([0-9]*\.?[0-9]+)s\]", replacer, text, flags=re.IGNORECASE)
 
 
-async def generate_tts_audio(text: str) -> Optional[bytes]:
-    """Generate TTS audio using gTTS"""
+async def generate_tts_audio(text: str, voice_key: str = DEFAULT_VOICE) -> Optional[bytes]:
+    """Generate TTS audio using gTTS with specified voice"""
     try:
         processed = apply_pauses(text)
         
-        # Create gTTS object
+        voice_config = VOICE_OPTIONS.get(voice_key, VOICE_OPTIONS[DEFAULT_VOICE])
+        
+        # Create gTTS object with specified voice
         tts = gTTS(
             text=processed,
-            lang='en',
+            lang=voice_config["lang"],
+            tld=voice_config["tld"],
             slow=False
         )
         
-        # Save to bytes buffer
         audio_buffer = io.BytesIO()
         tts.write_to_fp(audio_buffer)
         audio_buffer.seek(0)
@@ -131,7 +140,6 @@ async def send_voice_message(msg, audio_bytes: bytes, part_num: int = None) -> b
         return True
     except Exception as exc:
         logger.exception("Failed to send voice message: %s", exc)
-        # Fallback to audio file
         try:
             bio.seek(0)
             await msg.reply_audio(audio=InputFile(bio, filename="narration.mp3"), caption=caption)
@@ -151,13 +159,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text("Please send some text for narration.")
         return
 
+    # Check if message starts with voice command
+    voice_key = DEFAULT_VOICE
+    if raw.startswith('/voice '):
+        parts = raw.split(' ', 2)
+        if len(parts) >= 2:
+            requested_voice = parts[1].lower()
+            if requested_voice in VOICE_OPTIONS:
+                voice_key = requested_voice
+                if len(parts) > 2:
+                    raw = parts[2]
+                else:
+                    await msg.reply_text("Please provide text after the voice command.")
+                    return
+            else:
+                await msg.reply_text(
+                    f"Unknown voice. Available voices:\n" +
+                    "\n".join([f"- {key}: {config['name']}" for key, config in VOICE_OPTIONS.items()])
+                )
+                return
+
     # Split long text into manageable chunks
     text_chunks = split_long_text(raw, MAX_TEXT_LENGTH)
     
     if len(text_chunks) > 1:
-        await msg.reply_text(f"🎙️ Generating {len(text_chunks)} voice messages...")
+        await msg.reply_text(
+            f"🎙️ Generating {len(text_chunks)} voice messages with {VOICE_OPTIONS[voice_key]['name']} voice..."
+        )
     else:
-        await msg.reply_text("🎙️ Generating voice...")
+        await msg.reply_text(f"🎙️ Generating voice with {VOICE_OPTIONS[voice_key]['name']}...")
 
     successful_parts = 0
     
@@ -165,7 +195,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if len(text_chunks) > 1:
             status_msg = await msg.reply_text(f"🔄 Processing part {i}/{len(text_chunks)}...")
         
-        audio_bytes = await generate_tts_audio(chunk)
+        audio_bytes = await generate_tts_audio(chunk, voice_key)
         
         if not audio_bytes:
             if len(text_chunks) > 1:
@@ -174,24 +204,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await msg.reply_text("❌ Failed to generate voice message. Please try again.")
             continue
 
-        # Send the voice message
         success = await send_voice_message(msg, audio_bytes, i if len(text_chunks) > 1 else None)
         
         if success:
             successful_parts += 1
         
-        # Delete status message if it exists
         if len(text_chunks) > 1:
             try:
                 await status_msg.delete()
             except Exception:
                 pass
         
-        # Small delay between chunks to avoid rate limiting
         if i < len(text_chunks):
             await asyncio.sleep(CHUNK_DELAY)
 
-    # Send summary
     if len(text_chunks) > 1:
         if successful_parts == len(text_chunks):
             await msg.reply_text("✅ All voice messages generated successfully!")
@@ -202,11 +228,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    voice_list = "\n".join([f"- {key}: {config['name']}" for key, config in VOICE_OPTIONS.items()])
+    
     await update.message.reply_text(
-        "✅ Send me a script and I will narrate it!\n\n"
-        "📝 I can handle scripts of any length by splitting them into multiple voice messages.\n\n"
-        "💡 Use [PAUSE 0.5s] to add pauses in your narration.\n\n"
-        "🔊 Using Google Text-to-Speech for reliable voice generation."
+        f"✅ Send me a script and I will narrate it!\n\n"
+        f"📝 I can handle scripts of any length by splitting them into multiple voice messages.\n\n"
+        f"🔊 Available voices (use '/voice <name>' before your text):\n{voice_list}\n\n"
+        f"💡 Use [PAUSE 0.5s] to add pauses in your narration.\n\n"
+        f"🎯 Default voice: {VOICE_OPTIONS[DEFAULT_VOICE]['name']}"
+    )
+
+
+async def voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command to list all available voices"""
+    voice_list = "\n".join([f"- {key}: {config['name']}" for key, config in VOICE_OPTIONS.items()])
+    await update.message.reply_text(
+        f"🔊 Available voices:\n{voice_list}\n\n"
+        f"Usage: /voice <voice_name> <your_text>"
     )
 
 
@@ -234,6 +272,7 @@ async def main_async() -> None:
     # Build telegram application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("voices", voices))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Start aiohttp server
@@ -241,14 +280,12 @@ async def main_async() -> None:
     runner = await start_aiohttp_server(port)
 
     try:
-        # Start the bot using run_polling (this handles initialization and polling)
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
         
         logger.info("Bot started and polling...")
         
-        # Keep the bot running until interrupted
         while True:
             await asyncio.sleep(3600)
             
@@ -257,7 +294,6 @@ async def main_async() -> None:
     except Exception:
         logger.exception("Bot encountered an error")
     finally:
-        # Proper shutdown sequence
         try:
             if app.updater and app.updater.running:
                 await app.updater.stop()

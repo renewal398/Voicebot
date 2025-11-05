@@ -2,7 +2,6 @@ import os
 import re
 import base64
 import logging
-import threading
 import asyncio
 from typing import Optional
 
@@ -33,12 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 def apply_pauses(text: str) -> str:
-    """
-    Convert [PAUSE Xs] tokens into a sequence of dots to indicate a pause.
-    Example: "[PAUSE 1s]" -> "..." (about 1s).
-    We map 0.25s => 1 dot, 0.5s => 2 dots, 1s => 3 dots, scaling linearly.
-    Guarantee at least one dot for any positive amount.
-    """
     def replacer(match: re.Match) -> str:
         try:
             amount = float(match.group(1))
@@ -57,11 +50,6 @@ def apply_pauses(text: str) -> str:
     retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
 )
 async def post_tts(client: httpx.AsyncClient, payload: dict) -> dict:
-    """
-    Post to the TTS endpoint with retries for transient errors.
-    Raises httpx.HTTPStatusError on non-2xx responses.
-    Returns parsed JSON.
-    """
     resp = await client.post(PUTER_TTS_URL, json=payload, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
@@ -152,27 +140,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✅ Send me a script and I will narrate it!")
 
 
-def start_polling_in_thread(app):
-    """
-    Start the telegram Application.run_polling coroutine inside a dedicated
-    thread using asyncio.run so the thread has its own event loop.
-    """
-    def _run():
-        try:
-            asyncio.run(app.run_polling())
-        except Exception:
-            logger.exception("Polling thread exited with error")
-
-    t = threading.Thread(target=_run, name="telegram-polling", daemon=True)
-    t.start()
-    return t
-
-
-async def health(request):
+async def aio_health(request):
     return web.Response(text="ok")
 
 
-def main() -> None:
+async def start_aiohttp_server(port: int) -> web.AppRunner:
+    aio_app = web.Application()
+    aio_app.router.add_get("/", aio_health)
+    aio_app.router.add_get("/health", aio_health)
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("aiohttp server started on port %s", port)
+    return runner
+
+
+async def main_async() -> None:
     if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not BOT_TOKEN:
         logger.error("BOT_TOKEN is not set. Set the BOT_TOKEN environment variable.")
         return
@@ -182,18 +166,36 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Start polling in background thread (creates its own event loop)
-    start_polling_in_thread(app)
-    logger.info("Started polling thread for Telegram bot")
-
-    # Start aiohttp web server (bind to PORT required by Render web services)
+    # Start aiohttp server (bind to Render PORT)
     port = int(os.environ.get("PORT", "8080"))
-    aio_app = web.Application()
-    aio_app.router.add_get("/", health)
-    aio_app.router.add_get("/health", health)
+    runner = await start_aiohttp_server(port)
 
-    logger.info("Starting web server on port %s", port)
-    web.run_app(aio_app, host="0.0.0.0", port=port)
+    # Start polling as a background task in the same event loop
+    polling_task = asyncio.create_task(app.run_polling())
+    logger.info("Started telegram polling task")
+
+    # Wait until polling_task completes (it runs until cancelled or error)
+    try:
+        await polling_task
+    except asyncio.CancelledError:
+        logger.info("Polling task cancelled")
+    except Exception:
+        logger.exception("Polling task raised an exception")
+    finally:
+        # Cleanup: stop telegram app and aiohttp runner
+        try:
+            await app.shutdown()
+            await app.stop()
+        except Exception:
+            logger.exception("Error while shutting down telegram app")
+        try:
+            await runner.cleanup()
+        except Exception:
+            logger.exception("Error while shutting down aiohttp runner")
+
+
+def main() -> None:
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

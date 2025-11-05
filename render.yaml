@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: telegram-tts-bot
+    env: python
+    plan: free
+    pythonVersion: 3.11
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PUTER_TTS_URL
+        value: "https://api.puter.com/v2/ai/tts"

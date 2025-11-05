@@ -3,3 +3,5 @@ requests
 httpx
 tenacity
 aiohttp
+aiohttp==3.9.1
+gtts==2.5.1

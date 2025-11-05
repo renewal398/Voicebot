@@ -2,13 +2,12 @@
 import os
 import re
 import io
-import base64
 import logging
 import asyncio
 from typing import Optional, List
+from gtts import gTTS
+import tempfile
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from aiohttp import web
 from telegram import InputFile, Update
 from telegram.ext import (
@@ -21,13 +20,11 @@ from telegram.ext import (
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-PUTER_TTS_URL = os.getenv("PUTER_TTS_URL", "https://api.puter.com/v2/ai/tts")
 
 # Tunables
-HTTP_TIMEOUT = 10.0
-MAX_TEXT_LENGTH = 5000  # Increased limit for TTS service
-MAX_VOICE_MESSAGE_LENGTH = 4096  # Telegram's limit
-MAX_RETRIES = 3
+MAX_TEXT_LENGTH = 5000
+MAX_VOICE_MESSAGE_LENGTH = 4096
+CHUNK_DELAY = 1  # seconds between chunks
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -80,70 +77,43 @@ def split_long_text(text: str, max_length: int = MAX_TEXT_LENGTH) -> List[str]:
 
 
 def apply_pauses(text: str) -> str:
+    """Convert pause tags to natural pauses in speech"""
     def replacer(match: re.Match) -> str:
         try:
             amount = float(match.group(1))
         except (TypeError, ValueError):
             return match.group(0)
-        dots = max(1, int(round(amount / 0.25)))
-        return "." * dots
-
+        # For gTTS, we'll use commas and periods to create natural pauses
+        if amount <= 0.3:
+            return ","
+        else:
+            return "." * min(3, int(amount / 0.3))
+    
     return re.sub(r"\[PAUSE\s*([0-9]*\.?[0-9]+)s\]", replacer, text, flags=re.IGNORECASE)
 
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
-)
-async def post_tts(client: httpx.AsyncClient, payload: dict) -> dict:
-    resp = await client.post(PUTER_TTS_URL, json=payload, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def fetch_bytes(client: httpx.AsyncClient, url: str) -> bytes:
-    resp = await client.get(url, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    return resp.content
-
-
-async def generate_tts_audio(client: httpx.AsyncClient, text: str) -> Optional[bytes]:
-    """Generate TTS audio for given text"""
-    processed = apply_pauses(text)
-    
-    payload = {
-        "text": processed,
-        "engine": "fast",
-        "language": "en-US",
-        "voice": "Joanna"
-    }
-
+async def generate_tts_audio(text: str) -> Optional[bytes]:
+    """Generate TTS audio using gTTS"""
     try:
-        data = await post_tts(client, payload)
+        processed = apply_pauses(text)
+        
+        # Create gTTS object
+        tts = gTTS(
+            text=processed,
+            lang='en',
+            slow=False
+        )
+        
+        # Save to bytes buffer
+        audio_buffer = io.BytesIO()
+        tts.write_to_fp(audio_buffer)
+        audio_buffer.seek(0)
+        
+        return audio_buffer.getvalue()
+        
     except Exception as exc:
         logger.exception("TTS generation failed: %s", exc)
         return None
-
-    audio_bytes = None
-    audio_url = data.get("audio_url") or data.get("url")
-    
-    if audio_url:
-        try:
-            audio_bytes = await fetch_bytes(client, audio_url)
-        except Exception:
-            logger.exception("Failed to download audio from URL")
-            audio_bytes = None
-
-    if not audio_bytes and "audio" in data:
-        try:
-            audio_bytes = base64.b64decode(data["audio"])
-        except (TypeError, ValueError):
-            logger.error("Invalid base64 audio from TTS")
-            audio_bytes = None
-
-    return audio_bytes
 
 
 async def send_voice_message(msg, audio_bytes: bytes, part_num: int = None) -> bool:
@@ -151,7 +121,7 @@ async def send_voice_message(msg, audio_bytes: bytes, part_num: int = None) -> b
     try:
         bio = io.BytesIO(audio_bytes)
         bio.seek(0)
-        bio.name = "voice.ogg"
+        bio.name = "voice.mp3"
         
         caption = None
         if part_num is not None:
@@ -189,54 +159,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         await msg.reply_text("🎙️ Generating voice...")
 
-    async with httpx.AsyncClient() as client:
-        successful_parts = 0
-        
-        for i, chunk in enumerate(text_chunks, 1):
-            if len(text_chunks) > 1:
-                status_msg = await msg.reply_text(f"🔄 Processing part {i}/{len(text_chunks)}...")
-            
-            audio_bytes = await generate_tts_audio(client, chunk)
-            
-            if not audio_bytes:
-                if len(text_chunks) > 1:
-                    await msg.reply_text(f"❌ Failed to generate part {i}. Skipping...")
-                else:
-                    await msg.reply_text("❌ Failed to generate voice message. Please try again.")
-                continue
-
-            # Send the voice message
-            success = await send_voice_message(msg, audio_bytes, i if len(text_chunks) > 1 else None)
-            
-            if success:
-                successful_parts += 1
-            
-            # Delete status message if it exists
-            if len(text_chunks) > 1:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            
-            # Small delay between chunks to avoid rate limiting
-            if i < len(text_chunks):
-                await asyncio.sleep(1)
-
-        # Send summary
+    successful_parts = 0
+    
+    for i, chunk in enumerate(text_chunks, 1):
         if len(text_chunks) > 1:
-            if successful_parts == len(text_chunks):
-                await msg.reply_text("✅ All voice messages generated successfully!")
-            elif successful_parts > 0:
-                await msg.reply_text(f"⚠️ Generated {successful_parts}/{len(text_chunks)} voice messages.")
+            status_msg = await msg.reply_text(f"🔄 Processing part {i}/{len(text_chunks)}...")
+        
+        audio_bytes = await generate_tts_audio(chunk)
+        
+        if not audio_bytes:
+            if len(text_chunks) > 1:
+                await msg.reply_text(f"❌ Failed to generate part {i}. Skipping...")
             else:
-                await msg.reply_text("❌ Failed to generate any voice messages. Please try again.")
+                await msg.reply_text("❌ Failed to generate voice message. Please try again.")
+            continue
+
+        # Send the voice message
+        success = await send_voice_message(msg, audio_bytes, i if len(text_chunks) > 1 else None)
+        
+        if success:
+            successful_parts += 1
+        
+        # Delete status message if it exists
+        if len(text_chunks) > 1:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        
+        # Small delay between chunks to avoid rate limiting
+        if i < len(text_chunks):
+            await asyncio.sleep(CHUNK_DELAY)
+
+    # Send summary
+    if len(text_chunks) > 1:
+        if successful_parts == len(text_chunks):
+            await msg.reply_text("✅ All voice messages generated successfully!")
+        elif successful_parts > 0:
+            await msg.reply_text(f"⚠️ Generated {successful_parts}/{len(text_chunks)} voice messages.")
+        else:
+            await msg.reply_text("❌ Failed to generate any voice messages. Please try again.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "✅ Send me a script and I will narrate it!\n\n"
         "📝 I can handle scripts of any length by splitting them into multiple voice messages.\n\n"
-        "💡 Use [PAUSE 0.5s] to add pauses in your narration."
+        "💡 Use [PAUSE 0.5s] to add pauses in your narration.\n\n"
+        "🔊 Using Google Text-to-Speech for reliable voice generation."
     )
 
 
@@ -274,13 +244,13 @@ async def main_async() -> None:
         # Start the bot using run_polling (this handles initialization and polling)
         await app.initialize()
         await app.start()
-        await app.updater.start_polling()  # Start polling in the background
+        await app.updater.start_polling()
         
         logger.info("Bot started and polling...")
         
         # Keep the bot running until interrupted
         while True:
-            await asyncio.sleep(3600)  # Sleep for 1 hour
+            await asyncio.sleep(3600)
             
     except asyncio.CancelledError:
         logger.info("Received cancellation signal")

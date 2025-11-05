@@ -3,6 +3,7 @@ import re
 import base64
 import logging
 import threading
+import asyncio
 from typing import Optional
 
 import httpx
@@ -20,6 +21,7 @@ from telegram.ext import (
 # Configuration (fallback to environment variables)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 PUTER_TTS_URL = os.getenv("PUTER_TTS_URL", "https://api.puter.com/v2/ai/tts")
+
 # Tunables
 HTTP_TIMEOUT = 10.0  # seconds
 MAX_TEXT_LENGTH = 1200  # avoid extremely long TTS requests
@@ -55,6 +57,11 @@ def apply_pauses(text: str) -> str:
     retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
 )
 async def post_tts(client: httpx.AsyncClient, payload: dict) -> dict:
+    """
+    Post to the TTS endpoint with retries for transient errors.
+    Raises httpx.HTTPStatusError on non-2xx responses.
+    Returns parsed JSON.
+    """
     resp = await client.post(PUTER_TTS_URL, json=payload, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
@@ -146,9 +153,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def start_polling_in_thread(app):
+    """
+    Start the telegram Application.run_polling coroutine inside a dedicated
+    thread using asyncio.run so the thread has its own event loop.
+    """
     def _run():
         try:
-            app.run_polling()
+            asyncio.run(app.run_polling())
         except Exception:
             logger.exception("Polling thread exited with error")
 
@@ -166,13 +177,16 @@ def main() -> None:
         logger.error("BOT_TOKEN is not set. Set the BOT_TOKEN environment variable.")
         return
 
+    # Build telegram application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Start polling in background thread (creates its own event loop)
     start_polling_in_thread(app)
     logger.info("Started polling thread for Telegram bot")
 
+    # Start aiohttp web server (bind to PORT required by Render web services)
     port = int(os.environ.get("PORT", "8080"))
     aio_app = web.Application()
     aio_app.router.add_get("/", health)

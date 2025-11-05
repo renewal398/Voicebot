@@ -1,11 +1,14 @@
+`python
 import os
 import re
 import base64
 import logging
+import threading
 from typing import Optional
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stopafterattempt, waitexponential, retryifexceptiontype
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,17 +18,18 @@ from telegram.ext import (
     ContextTypes
 )
 
-# Configuration (fallback to environment variables)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-PUTER_TTS_URL = os.getenv("PUTER_TTS_URL", "https://api.puter.com/v2/ai/tts")
-# Tunables
+Configuration (fallback to environment variables)
+BOTTOKEN = os.getenv("BOTTOKEN", "YOURTELEGRAMBOT_TOKEN")
+PUTERTTSURL = os.getenv("PUTERTTSURL", "https://api.puter.com/v2/ai/tts")
+
+Tunables
 HTTP_TIMEOUT = 10.0  # seconds
-MAX_TEXT_LENGTH = 1200  # avoid extremely long TTS requests
+MAXTEXTLENGTH = 1200  # avoid extremely long TTS requests
 MAX_RETRIES = 3
 
-# Logging
+Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(name)
 
 
 def apply_pauses(text: str) -> str:
@@ -44,14 +48,14 @@ def apply_pauses(text: str) -> str:
         dots = max(1, int(round(amount / 0.25)))
         return "." * dots
 
-    return re.sub(r"\[PAUSE\s*([0-9]*\.?[0-9]+)s\]", replacer, text, flags=re.IGNORECASE)
+    return re.sub(r"\[PAUSE\s([0-9]\.?[0-9]+)s\]", replacer, text, flags=re.IGNORECASE)
 
 
 @retry(
     reraise=True,
-    stop=stop_after_attempt(MAX_RETRIES),
+    stop=stopafterattempt(MAX_RETRIES),
     wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
+    retry=retryifexception_type((httpx.RequestError, httpx.HTTPStatusError))
 )
 async def post_tts(client: httpx.AsyncClient, payload: dict) -> dict:
     """
@@ -59,18 +63,18 @@ async def post_tts(client: httpx.AsyncClient, payload: dict) -> dict:
     Raises httpx.HTTPStatusError on non-2xx responses.
     Returns parsed JSON.
     """
-    resp = await client.post(PUTER_TTS_URL, json=payload, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
+    resp = await client.post(PUTERTTSURL, json=payload, timeout=HTTP_TIMEOUT)
+    resp.raiseforstatus()
     return resp.json()
 
 
 async def fetch_bytes(client: httpx.AsyncClient, url: str) -> bytes:
     resp = await client.get(url, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
+    resp.raiseforstatus()
     return resp.content
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handlemessage(update: Update, context: ContextTypes.DEFAULTTYPE) -> None:
     msg = update.message
     if not msg or not msg.text:
         return
@@ -80,8 +84,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text("Please send some text for narration.")
         return
 
-    if len(raw) > MAX_TEXT_LENGTH:
-        await msg.reply_text(f"Message too long (max {MAX_TEXT_LENGTH} characters). Please shorten it.")
+    if len(raw) > MAXTEXTLENGTH:
+        await msg.replytext(f"Message too long (max {MAXTEXT_LENGTH} characters). Please shorten it.")
         return
 
     await msg.reply_text("🎙️ Generating voice...")
@@ -116,12 +120,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         audio_bytes: Optional[bytes] = None
 
         # Option 1: audio_url or url field
-        audio_url = data.get("audio_url") or data.get("url")
+        audiourl = data.get("audiourl") or data.get("url")
         if audio_url:
             try:
-                audio_bytes = await fetch_bytes(client, audio_url)
+                audiobytes = await fetchbytes(client, audio_url)
             except httpx.HTTPStatusError as exc:
-                logger.error("Failed to download audio from url: %s %s", audio_url, exc.response.status_code)
+                logger.error("Failed to download audio from url: %s %s", audiourl, exc.response.statuscode)
                 audio_bytes = None
             except httpx.RequestError:
                 logger.exception("Network error when downloading audio from url: %s", audio_url)
@@ -142,7 +146,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Send as voice note (telegram expects bytes-like)
         try:
-            await msg.reply_voice(voice=audio_bytes)
+            await msg.replyvoice(voice=audiobytes)
         except Exception as exc:
             logger.exception("Failed to send voice message: %s", exc)
             await msg.reply_text("❌ Failed to send voice message. Please try again.")
@@ -152,19 +156,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✅ Send me a script and I will narrate it!")
 
 
+def startpollingin_thread(app):
+    """
+    Start the Application.run_polling in a daemon thread so the main thread can
+    run the web server that binds to PORT (Render requirement for Web Services).
+    """
+    def _run():
+        try:
+            app.run_polling()
+        except Exception:
+            logger.exception("Polling thread exited with error")
+
+    t = threading.Thread(target=_run, name="telegram-polling", daemon=True)
+    t.start()
+    return t
+
+
+async def health(request):
+    return web.Response(text="ok")
+
+
 def main() -> None:
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set. Set the BOT_TOKEN environment variable.")
+    if BOTTOKEN == "YOURTELEGRAMBOTTOKEN" or not BOT_TOKEN:
+        logger.error("BOTTOKEN is not set. Set the BOTTOKEN environment variable.")
         return
 
+    # Build telegram application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.addhandler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlemessage))
 
-    logger.info("Bot running...")
-    app.run_polling()
+    # Start polling in background thread
+    startpollingin_thread(app)
+    logger.info("Started polling thread for Telegram bot")
+
+    # Start aiohttp web server (bind to PORT required by Render web services)
+    port = int(os.environ.get("PORT", "8080"))
+    aio_app = web.Application()
+    aioapp.router.addget("/", health)
+    aioapp.router.addget("/health", health)
+
+    logger.info("Starting web server on port %s", port)
+    web.runapp(aioapp, host="0.0.0.0", port=port)
 
 
-if __name__ == "__main__":
+if name == "main":
     main()
+`
